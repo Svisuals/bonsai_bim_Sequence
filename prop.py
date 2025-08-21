@@ -85,42 +85,18 @@ def get_operator_items(self, context):
             ('NOT_CONTAINS', "Does not contain", "The text string is not contained"),
         ] + common_ops
 
-
 def update_filter_column(self, context):
     """
     Callback que se ejecuta al cambiar la columna del filtro.
     Identifica el tipo de dato y resetea los valores para evitar inconsistencias.
-    CORREGIDO: Evita interferir con el sistema de perfiles.
     """
     try:
-        parts = (self.column or "").split("||")
-        self.data_type = parts[1] if len(parts) == 2 else "string"
-        # Reset values
-        self.value_string = ""
-        self.value_integer = 0
-        self.value_float = 0.0
-        self.value_boolean = False
-    except Exception as e:
-        self.data_type = "string"
-        print(f"Warning: Filter column update failed: {e}")
-        # Reset values on failure
-        self.value_string = ""
-        self.value_integer = 0
-        self.value_float = 0.0
-        self.value_boolean = False
-
-
-        # Resetear todos los campos de valor para empezar de cero
-        self.value_string = ""
-        self.value_integer = 0
-        self.value_float = 0.0
-        self.value_boolean = False
-
-        # CRÍTICO: NO disparar actualizaciones del sistema de perfiles aquí
-        # Solo manejar la lógica del filtro
-    except Exception as e:
-        self.data_type = 'string'
-        print(f"Warning: Filter column update failed: {e}")
+        # El identificador ahora es 'IfcTask.Name||string'. Extraemos el tipo de dato.
+        parts = (self.column or "").split('||')
+        if len(parts) == 2:
+            self.data_type = parts[1]
+        else:
+            self.data_type = 'string' # Tipo por defecto seguro
 
         # Resetear todos los campos de valor para empezar de cero
         self.value_string = ""
@@ -284,19 +260,6 @@ class UnifiedProfileManager:
         """
         if not task_pg: return
         
-        # NUEVA PROTECCIÓN: No sobrescribir configuraciones personalizadas activas
-        try:
-            # Verificar si hay un grupo personalizado configurado
-            anim_props = tool.Sequence.get_animation_props()
-            custom_group = getattr(anim_props, "task_profile_group_selector", "")
-            task_uses_custom = getattr(task_pg, "use_active_profile_group", False)
-
-            # Si hay configuración personalizada activa, no interferir
-            if custom_group and task_uses_custom:
-                print(f"[SYNC-SKIP] Task {getattr(task_pg, 'ifc_definition_id', '?')} has custom profile config, skipping DEFAULT sync")
-                return
-        except Exception as e:
-            print(f"Warning: Profile protection check failed: {e}")
         # 1. Obtener el PredefinedType actual de la tarea desde los datos cacheados.
         try:
             from bonsai.bim.module.sequence.data import SequenceData
@@ -597,160 +560,146 @@ def get_appearance_profile_items(self, context):
     return items
 
 
-
 def get_custom_group_profile_items(self, context):
-    """Gets profile items ONLY from the selected custom group (excludes DEFAULT)"""
+    """
+    Gets profile items ONLY from the selected custom group (excludes DEFAULT).
+    This version reads directly from the JSON and is more lenient to allow UI selection
+    even if profile data is incomplete.
+    """
+    items = []
     try:
         anim_props = tool.Sequence.get_animation_props()
         selected_group = getattr(anim_props, "task_profile_group_selector", "")
-        if not selected_group:
-            return [("", "<no group selected>", "Select a custom group first")]
-        profiles = UnifiedProfileManager.get_profiles_from_specific_group(context, selected_group)
-        if profiles:
-            items = []
-            for i, profile_name in enumerate(sorted(profiles)):
-                items.append((profile_name, profile_name, f"Profile from group {selected_group}", i))
-            return items
-        else:
-            return [("", f"<no profiles in {selected_group}>", f"Group {selected_group} has no profiles")]
+        
+        if selected_group and selected_group != "DEFAULT":
+            # Lectura directa y flexible desde el JSON
+            all_sets = UnifiedProfileManager._read_sets_json(context)
+            group_data = all_sets.get(selected_group, {})
+            profiles_list = group_data.get("profiles", [])
+            
+            profile_names = []
+            for profile in profiles_list:
+                if isinstance(profile, dict) and "name" in profile:
+                    profile_names.append(profile["name"])
+            
+            for i, name in enumerate(sorted(profile_names)):
+                items.append((name, name, f"Profile from {selected_group}", i))
+    
     except Exception as e:
-        print(f"Error in get_custom_group_profile_items: {e}")
-        return [("", "<error>", "Error loading profiles")]
+        print(f"Error getting custom group profiles: {e}")
+        items.append(("", "<error loading profiles>", "", 0))
 
-
-
-
+    if not items:
+        anim_props = tool.Sequence.get_animation_props()
+        selected_group = getattr(anim_props, "task_profile_group_selector", "")
+        if not selected_group:
+            items.append(("", "<select custom group first>", "", 0))
+        elif selected_group == "DEFAULT":
+            items.append(("", "<DEFAULT not allowed here>", "", 0))
+        else:
+            items.append(("", f"<no profiles in {selected_group}>", "", 0))
+            
+    return items
 
 def update_active_task_index(self, context):
     """
-    CORREGIDO: Respeta la configuración de grupos personalizados sin forzar DEFAULT
+    Updates active task index, synchronizes profiles,
+    and selects associated 3D objects in the viewport (for single click).
     """
-    # Resolve current task and highlight
     task_ifc = tool.Sequence.get_highlighted_task()
     self.highlighted_task_id = task_ifc.id() if task_ifc else 0
     tool.Sequence.update_task_ICOM(task_ifc)
+    bonsai.bim.module.pset.data.refresh()
+
+    if self.editing_task_type == "SEQUENCE":
+        tool.Sequence.load_task_properties()
+
     try:
-        bonsai.bim.module.pset.data.refresh()
-    except Exception:
-        pass
-
-    if getattr(self, "editing_task_type", "") == "SEQUENCE":
-        try:
-            tool.Sequence.load_task_properties()
-        except Exception:
-            pass
-
-    # ---- NUEVO: Profile sync guard mejorado ----
-    try:
-        anim_props = tool.Sequence.get_animation_props()
-        # Verificar si hay un grupo personalizado activo
-        custom_group = getattr(anim_props, "task_profile_group_selector", "")
-        is_using_custom_group = bool(custom_group and custom_group != "DEFAULT")
-        # Verificar si estamos en medio de una operación que no debe interferir
-        sc = getattr(context, "scene", None)
-        try:
-            active_op = (sc.get("active_operation") or "").lower() if sc else ""
-        except Exception:
-            active_op = ""
-        is_protected_operation = any(k in active_op for k in ("filter", "datepicker", "apply_task_filters", "snapshot", "animation"))
-
-        Unified = globals().get("UnifiedProfileManager")
-        if Unified:
-            try:
-                Unified.ensure_default_group(context)
-            except Exception:
-                pass
-            # Solo sincronizar con DEFAULT si no hay configuración personalizada y no hay operación protegida
-            if not is_using_custom_group and not is_protected_operation:
-                try:
-                    tprops = tool.Sequence.get_task_tree_props()
-                    if tprops.tasks and self.active_task_index < len(tprops.tasks):
-                        task_pg = tprops.tasks[self.active_task_index]
-                        Unified.sync_default_group_to_predefinedtype(context, task_pg)
-                        # Sync task profiles only when safe
-                        if getattr(anim_props, "profile_groups", "") and not is_using_custom_group:
-                            Unified.sync_task_profiles(context, task_pg, anim_props.profile_groups)
-                except Exception:
-                    pass
+        tprops = tool.Sequence.get_task_tree_props()
+        if tprops.tasks and self.active_task_index < len(tprops.tasks):
+            task_pg = tprops.tasks[self.active_task_index]
+            if 'UnifiedProfileManager' in globals() and UnifiedProfileManager:
+                UnifiedProfileManager.sync_default_group_to_predefinedtype(context, task_pg)
+                anim_props = tool.Sequence.get_animation_props()
+                if anim_props.profile_groups:
+                    UnifiedProfileManager.sync_task_profiles(context, task_pg, anim_props.profile_groups)
     except Exception as e:
-        print(f"[update_active_task_index] profile guard error: {e}")
+        print(f"[ERROR] Error syncing profiles in update_active_task_index: {e}")
 
-    # ---- 3D selection behaviour (sin cambios) ----
+    # --- COMIENZO DEL CÓDIGO CORREGIDO ---
+    # --- LÓGICA DE SELECCIÓN 3D PARA CLIC INDIVIDUAL ---
     if not task_ifc:
         try:
             bpy.ops.object.select_all(action='DESELECT')
-        except Exception:
+        except RuntimeError:
+            # Ocurre si no estamos en modo objeto, es seguro ignorarlo.
             pass
         return
 
     try:
-        highlight_related = True
-        if highlight_related:
-            _ = tool.Sequence.select_related_products_of(task_ifc)
+        outputs = tool.Sequence.get_task_outputs(task_ifc)
+        
+        # Deseleccionar todo lo demás primero
+        if bpy.context.view_layer.objects.active:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.select_all(action='DESELECT')
+
+        if outputs:
+            objects_to_select = [tool.Ifc.get_object(p) for p in outputs if tool.Ifc.get_object(p)]
+            
+            if objects_to_select:
+                for obj in objects_to_select:
+                    # <-- PASO 1: Asegurarse de que el objeto sea visible y seleccionable
+                    obj.hide_set(False)
+                    obj.hide_select = False
+                    
+                    # <-- PASO 2: Seleccionar el objeto
+                    obj.select_set(True)
+                
+                # <-- PASO 3: Establecer el primer objeto como activo
+                context.view_layer.objects.active = objects_to_select[0]
+                
+                # <-- PASO 4: Centrar la vista 3D en los objetos seleccionados
+                bpy.ops.view3d.view_selected()
+                
     except Exception as e:
-        print(f"[update_active_task_index] selection skipped: {e}")
+        print(f"Error selecting 3D objects for task: {e}")
+    # --- FIN DEL CÓDIGO CORREGIDO ---
 
-
-    if getattr(self, "editing_task_type", "") == "SEQUENCE":
-        try:
-            tool.Sequence.load_task_properties()
-        except Exception:
-            pass
-
-    # ---- Profile sync guard ----
+    items = []
     try:
         anim_props = tool.Sequence.get_animation_props()
-        selected_group = (
-            getattr(anim_props, "task_profile_group_selector", "")
-            or getattr(anim_props, "profile_groups", "")
-            or "DEFAULT"
-        )
-        is_custom_group = bool(selected_group and selected_group != "DEFAULT")
+        selected_group = getattr(anim_props, "task_profile_group_selector", "")
+        
+        print(f"ðŸ”  Getting profiles for custom group: '{selected_group}'")
+        
+        # CRÃ TICO: Solo mostrar perfiles si hay un grupo personalizado seleccionado
+        if selected_group and selected_group != "DEFAULT":
+            from bonsai.bim.module.sequence.prop import UnifiedProfileManager
+            profiles = UnifiedProfileManager.get_group_profiles(context, selected_group)
+            
+            for i, name in enumerate(sorted(profiles.keys())):
+                items.append((name, name, f"Profile from {selected_group}", i))
+            
+            print(f"âœ… Found {len(items)} profiles in group '{selected_group}'")
 
-        sc = getattr(context, "scene", None)
-        try:
-            active_op = (sc.get("active_operation") or "").lower() if sc else ""
-        except Exception:
-            active_op = ""
-        is_filter_op = any(k in active_op for k in ("filter", "datepicker", "apply_task_filters"))
-
-        Unified = globals().get("UnifiedProfileManager")
-        if Unified:
-            # Always ensure DEFAULT exists, but do NOT sync to predefined type if user is on a custom group
-            # or we are in the middle of a filter operation.
-            try:
-                Unified.ensure_default_group(context)
-            except Exception:
-                pass
-            if not is_custom_group and not is_filter_op:
-                try:
-                    tprops = tool.Sequence.get_task_tree_props()
-                    if tprops.tasks and self.active_task_index < len(tprops.tasks):
-                        task_pg = tprops.tasks[self.active_task_index]
-                        Unified.sync_default_group_to_predefinedtype(context, task_pg)
-                        # Also sync task profiles only when safe
-                        if anim_props.profile_groups:
-                            Unified.sync_task_profiles(context, task_pg, anim_props.profile_groups)
-                except Exception:
-                    pass
     except Exception as e:
-        print(f"[update_active_task_index] profile guard skipped: {e}")
+        print(f"â Œ Error getting custom group profiles: {e}")
+        items = [("", "<error loading profiles>", "", 0)]
 
-    # ---- 3D selection behaviour ----
-    if not task_ifc:
-        try:
-            bpy.ops.object.select_all(action='DESELECT')
-        except Exception:
-            pass
-        return
+    if not items:
+        anim_props = tool.Sequence.get_animation_props()
+        selected_group = getattr(anim_props, "task_profile_group_selector", "")
+        if not selected_group:
+            items = [("", "<select custom group first>", "", 0)]
+        elif selected_group == "DEFAULT":
+            items = [("", "<DEFAULT not allowed here>", "", 0)]
+        else:
+            items = [("", f"<no profiles in {selected_group}>", "", 0)]
+            
+    return items
 
-    # Selección de objetos relacionados con la tarea
-    try:
-        highlight_related = True
-        if highlight_related:
-            objs = tool.Sequence.select_related_products_of(task_ifc)
-    except Exception as e:
-        print(f"[update_active_task_index] selection skipped: {e}")
+
 def update_active_task_outputs(self, context):
     task = tool.Sequence.get_highlighted_task()
     outputs = tool.Sequence.get_task_outputs(task)
