@@ -612,20 +612,6 @@ def _apply_profile_animation(context, product_frames, settings):
     import bonsai.core.sequence as _core
     _core.animate_objects(tool.Sequence, product_frames, settings)
 
-
-def _preferred_group(ap):
-    """Return the UI-preferred profile group name.
-    Priority: task_profile_group_selector > profile_groups > 'DEFAULT'.
-    """
-    try:
-        tg = getattr(ap, "task_profile_group_selector", "") or ""
-    except Exception:
-        tg = ""
-    try:
-        pg = getattr(ap, "profile_groups", "") or ""
-    except Exception:
-        pg = ""
-    return tg or pg or "DEFAULT"
 def _ensure_default_group(context):
     # Ensure internal DEFAULT exists
     try:
@@ -639,16 +625,15 @@ def _ensure_default_group(context):
         # Newer stack
         if hasattr(ap, "animation_group_stack") and len(ap.animation_group_stack) == 0:
             it = ap.animation_group_stack.add()
-            it.group = _preferred_group(ap)
+            it.group = getattr(ap, "profile_groups", "") or "DEFAULT"
             _safe_set(it, 'enabled', True)
         # Older stack
         if hasattr(ap, "profile_stack") and len(ap.profile_stack) == 0:
             it = ap.profile_stack.add()
-            it.group = _preferred_group(ap)
+            it.group = getattr(ap, "profile_groups", "") or "DEFAULT"
             _safe_set(it, 'enabled', True)
     except Exception:
         pass
-
 def _clean_task_profile_mappings(context, removed_group_name: str | None = None):
     """
     Ensures per-task mapping stays consistent:
@@ -1916,99 +1901,55 @@ class VisualiseWorkScheduleDate(bpy.types.Operator):
         return bool(props.visualisation_start)
 
     def execute(self, context):
-        # --- PROTECCIÓN: Marcar operación como snapshot ---
+        # --- INICIO DE LA CORRECCIÓN ---
+        # 1. FORZAR LA SINCRONIZACIÓN: Al igual que con la animación, esto asegura
+        #    que el snapshot use los datos más actualizados del grupo que se está editando.
         try:
-            context.scene['active_operation'] = 'snapshot'
-        except Exception:
-            pass
+            tool.Sequence.sync_active_group_to_json()
+        except Exception as e:
+            print(f"Error syncing profiles for snapshot: {e}")
+        # --- FIN DE LA CORRECCIÓN ---
 
-        # --- PRESERVAR: Configuración actual de grupos ---
-        preserved_profile_config = {}
-        try:
-            anim_props = tool.Sequence.get_animation_props()
-            preserved_profile_config = {
-                'profile_groups': getattr(anim_props, 'profile_groups', ''),
-                'task_profile_group_selector': getattr(anim_props, 'task_profile_group_selector', ''),
-            }
-            print(f"🔒 Snapshot: Preserving profile config: {preserved_profile_config}")
-        except Exception:
-            pass
+        # Obtener el work schedule
+        work_schedule = tool.Ifc.get().by_id(self.work_schedule)
 
-        # --- EJECUTAR: Lógica original del snapshot ---
-        try:
-            # 1. FORZAR LA SINCRONIZACIÓN solo si NO hay configuración personalizada
-            custom_group = preserved_profile_config.get('task_profile_group_selector', '')
-            if not custom_group:
-                try:
-                    tool.Sequence.sync_active_group_to_json()
-                except Exception as e:
-                    print(f"Error syncing profiles for snapshot: {e}")
+        # NUEVA CORRECCIÓN: Obtener el rango de visualización configurado
+        viz_start, viz_finish = tool.Sequence.get_visualization_date_range()
 
-            # Obtener el work schedule
-            work_schedule = tool.Ifc.get().by_id(self.work_schedule)
+        if not viz_start:
+            self.report({'ERROR'}, "No start date configured for visualization")
+            return {'CANCELLED'}
 
-            # Obtener el rango de visualización configurado
-            viz_start, viz_finish = tool.Sequence.get_visualization_date_range()
+        # CORRECCIÓN: Usar la fecha de inicio de visualización como fecha del snapshot
+        snapshot_date = viz_start
 
-            if not viz_start:
-                self.report({'ERROR'}, "No start date configured for visualization")
-                return {'CANCELLED'}
+        # Ejecutar la lógica central de visualización CON el rango de visualización
+        product_states = tool.Sequence.process_construction_state(
+            work_schedule,
+            snapshot_date,
+            viz_start=viz_start,
+            viz_finish=viz_finish  # NUEVO: Pasar el rango de visualización
+        )
 
-            # Usar la fecha de inicio de visualización como fecha del snapshot
-            snapshot_date = viz_start
+        # Aplicar el snapshot con los estados corregidos
+        tool.Sequence.show_snapshot(product_states)
 
-            # Ejecutar la lógica central de visualización CON el rango de visualización
-            product_states = tool.Sequence.process_construction_state(
-                work_schedule,
-                snapshot_date,
-                viz_start=viz_start,
-                viz_finish=viz_finish
-            )
+        # Dar feedback claro al usuario sobre qué grupo se usó
+        anim_props = tool.Sequence.get_animation_props()
+        active_group = None
+        for stack_item in anim_props.animation_group_stack:
+            if getattr(stack_item, 'enabled', False) and stack_item.group:
+                active_group = stack_item.group
+                break
 
-            # Aplicar el snapshot con los estados corregidos
-            tool.Sequence.show_snapshot(product_states)
+        group_used = active_group or "DEFAULT"
 
-            # Información sobre el grupo usado
-            anim_props = tool.Sequence.get_animation_props()
-            active_group = None
-
-            # Priorizar grupo personalizado si está configurado
-            if custom_group:
-                active_group = custom_group
-            else:
-                # Buscar en animation stack
-                for stack_item in anim_props.animation_group_stack:
-                    if getattr(stack_item, 'enabled', False) and stack_item.group:
-                        active_group = stack_item.group
-                        break
-
-            group_used = active_group or "DEFAULT"
-
-            viz_end_str = viz_finish.strftime('%Y-%m-%d') if viz_finish else "No limit"
-            self.report({'INFO'}, f"Snapshot at {snapshot_date.strftime('%Y-%m-%d')} using group '{group_used}' (range: {viz_start.strftime('%Y-%m-%d')} to {viz_end_str})")
-
-        finally:
-            # --- RESTAURAR: Configuración original ---
-            try:
-                if preserved_profile_config:
-                    anim_props = tool.Sequence.get_animation_props()
-                    anim_props.profile_groups = preserved_profile_config.get('profile_groups', '')
-                    anim_props.task_profile_group_selector = preserved_profile_config.get('task_profile_group_selector', '')
-                    print(f"🔓 Snapshot: Restored profile config: {preserved_profile_config}")
-            except Exception:
-                pass
-
-            # --- LIMPIAR: Marcador de operación ---
-            try:
-                if 'active_operation' in context.scene:
-                    del context.scene['active_operation']
-            except Exception:
-                try:
-                    context.scene['active_operation'] = ''
-                except Exception:
-                    pass
+        # NUEVO: Información adicional sobre el filtrado
+        viz_end_str = viz_finish.strftime('%Y-%m-%d') if viz_finish else "No limit"
+        self.report({'INFO'}, f"Snapshot at {snapshot_date.strftime('%Y-%m-%d')} using group '{group_used}' (range: {viz_start.strftime('%Y-%m-%d')} to {viz_end_str})")
 
         return {"FINISHED"}
+
 class GuessDateRange(bpy.types.Operator, tool.Ifc.Operator):
     bl_idname = "bim.guess_date_range"
     bl_label = "Guess Work Schedule Date Range"
@@ -2093,32 +2034,9 @@ class VisualiseWorkScheduleDateRange(bpy.types.Operator):
         return has_start and has_finish
 
     def execute(self, context):
-        # --- PROTECCIÓN: Marcar operación como animación ---
         try:
-            context.scene['active_operation'] = 'animation'
-        except Exception:
-            pass
-
-        # --- PRESERVAR: Configuración actual de grupos ---
-        preserved_profile_config = {}
-        try:
-            anim_props = tool.Sequence.get_animation_props()
-            preserved_profile_config = {
-                'profile_groups': getattr(anim_props, 'profile_groups', ''),
-                'task_profile_group_selector': getattr(anim_props, 'task_profile_group_selector', ''),
-            }
-            print(f"🔒 Animation: Preserving profile config: {preserved_profile_config}")
-        except Exception:
-            pass
-
-        try:
-            # --- 1. Lógica de animación de productos ---
-            custom_group = preserved_profile_config.get('task_profile_group_selector', '')
-
-            # Solo sincronizar si NO hay configuración personalizada
-            if not custom_group:
-                tool.Sequence.sync_active_group_to_json()
-
+            # --- 1. Lógica de animación de productos (sin cambios) ---
+            tool.Sequence.sync_active_group_to_json()
             work_schedule = tool.Ifc.get().by_id(self.work_schedule)
             settings = tool.Sequence.get_animation_settings()
             if not work_schedule or not settings:
@@ -2137,29 +2055,33 @@ class VisualiseWorkScheduleDateRange(bpy.types.Operator):
             bpy.context.scene.frame_start = settings["start_frame"]
             bpy.context.scene.frame_end = int(settings["start_frame"] + settings["total_frames"])
 
-            # --- 2. Lógica de cámara (sin cambios) ---
+            # --- 2. LÓGICA DE CÁMARA CORREGIDA ---
+            # --- 2. LÓGICA DE CÁMARA CORREGIDA ---
             if self.camera_action != 'NONE':
                 existing_cam = next((obj for obj in bpy.data.objects if "4D_Animation_Camera" in obj.name), None)
 
                 if self.camera_action == 'UPDATE':
                     if existing_cam:
                         self.report({'INFO'}, f"Updating existing camera: {existing_cam.name}")
+                        # CORRECCIÓN: Llamar a la función solo con el objeto cámara.
                         tool.Sequence.update_animation_camera(existing_cam)
                     else:
                         self.report({'INFO'}, "No existing camera to update. Creating a new one instead.")
+                        # CORRECCIÓN: Llamar a la función sin argumentos.
                         tool.Sequence.add_animation_camera()
                 elif self.camera_action == 'CREATE_NEW':
                     self.report({'INFO'}, "Creating a new 4D camera.")
+                    # CORRECCIÓN: Llamar a la función sin argumentos.
                     tool.Sequence.add_animation_camera()
 
-            # --- HUD setup (sin cambios) ---
+                        # --- CONFIGURACIÓN AUTOMÁTICA DEL HUD (Sistema Dual) ---
             try:
                 if settings and settings.get("start") and settings.get("finish"):
                     print("🎬 Auto-configuring HUD Compositor for high-quality renders...")
                     bpy.ops.bim.setup_hud_compositor()
                     print("✅ HUD Compositor auto-configured successfully")
                     print("📹 Regular renders (Ctrl+F12) will now include HUD overlay")
-                else:
+                else: # Fallback al HUD de Viewport si no hay timeline
                     bpy.ops.bim.enable_schedule_hud()
             except Exception as e:
                 print(f"⚠️ Auto-setup of HUD failed: {e}. Falling back to Viewport HUD.")
@@ -2167,26 +2089,31 @@ class VisualiseWorkScheduleDateRange(bpy.types.Operator):
                     bpy.ops.bim.enable_schedule_hud()
                 except Exception:
                     pass
-
-            # HUD text visibility sync
+            
+            # <-- INICIO DE LA CORRECCIÓN DE VISIBILIDAD DE TEXTOS 3D -->
             try:
                 anim_props = tool.Sequence.get_animation_props()
                 camera_props = anim_props.camera_orbit
                 collection = bpy.data.collections.get("Schedule_Display_Texts")
-
+                
                 if collection:
+                    # Sincroniza la visibilidad de la colección con el estado del checkbox.
+                    # Si show_3d_schedule_texts es False, hide_viewport debe ser True.
                     should_hide = not getattr(camera_props, "show_3d_schedule_texts", False)
                     collection.hide_viewport = should_hide
                     collection.hide_render = should_hide
-
+                    
+                    # Forzar redibujado de la vista 3D para que el cambio sea inmediato.
                     for window in context.window_manager.windows:
                         for area in window.screen.areas:
                             if area.type == 'VIEW_3D':
                                 area.tag_redraw()
             except Exception as e:
                 print(f"⚠️ Could not sync 3D text visibility: {e}")
+            # <-- FIN DE LA CORRECCIÓN -->
 
             self.report({'INFO'}, f"Animation created successfully for {len(product_frames)} products.")
+            return {'FINISHED'}
 
         except Exception as e:
             import traceback
@@ -2194,28 +2121,6 @@ class VisualiseWorkScheduleDateRange(bpy.types.Operator):
             self.report({'ERROR'}, f"Animation failed: {str(e)}")
             return {'CANCELLED'}
 
-        finally:
-            # --- RESTAURAR: Configuración original ---
-            try:
-                if preserved_profile_config:
-                    anim_props = tool.Sequence.get_animation_props()
-                    anim_props.profile_groups = preserved_profile_config.get('profile_groups', '')
-                    anim_props.task_profile_group_selector = preserved_profile_config.get('task_profile_group_selector', '')
-                    print(f"🔓 Animation: Restored profile config: {preserved_profile_config}")
-            except Exception:
-                pass
-
-            # --- LIMPIAR: Marcador de operación ---
-            try:
-                if 'active_operation' in context.scene:
-                    del context.scene['active_operation']
-            except Exception:
-                try:
-                    context.scene['active_operation'] = ''
-                except Exception:
-                    pass
-
-        return {'FINISHED'}
     def invoke(self, context, event):
         # CORRECCIÓN: La búsqueda de la cámara es más robusta.
         existing_cam = next((obj for obj in bpy.data.objects if "4D_Animation_Camera" in obj.name), None)
@@ -2253,26 +2158,6 @@ class CreateAnimation(bpy.types.Operator, tool.Ifc.Operator):
 
         # Ensure default group & stack
         _ensure_default_group(context)
-
-        # --- Force preferred profile group before any frame computation ---
-        try:
-            ap = tool.Sequence.get_animation_props()
-            ws_props = tool.Sequence.get_work_schedule_props()
-            _sel = _preferred_group(ap)
-            try:
-                ap.profile_groups = _sel
-            except Exception:
-                pass
-            try:
-                ws_props.task_profile_group = _sel
-            except Exception:
-                pass
-            try:
-                tool.Sequence.sync_active_group_to_json()
-            except Exception:
-                pass
-        except Exception as _e:
-            print(f"[Animation] Could not lock preferred group: {_e}")
 
         # Clear previous
         _clear_previous_animation(context)
@@ -2388,7 +2273,7 @@ class SnapshotWithProfiles(tool.Ifc.Operator, bpy.types.Operator):
                         break
             # Fallback to UI-selected group
             if not snap_group:
-                snap_group = getattr(anim_props, 'task_profile_group_selector', None) or getattr(anim_props, 'profile_groups', None)
+                snap_group = getattr(anim_props, 'profile_groups', None)
             # Final fallback
             if not snap_group:
                 snap_group = 'DEFAULT'
@@ -3084,10 +2969,22 @@ class AddAppearanceProfile(bpy.types.Operator):
         props = tool.Sequence.get_animation_props()
         new_profile = props.profiles.add()
         new_profile.name = f"Profile {len(props.profiles)}"
-        try:
-            new_profile.active_color = (1.0, 0.5, 0.0, 1.0)
-        except Exception:
-            pass
+        
+        # --- NUEVA INICIALIZACIÓN COMPLETA ---
+        # Establece todos los campos requeridos con valores por defecto para asegurar la validez.
+        new_profile.start_color = (1.0, 1.0, 1.0, 1.0)
+        new_profile.in_progress_color = (1.0, 0.5, 0.0, 1.0)
+        new_profile.end_color = (0.0, 1.0, 0.0, 1.0)
+        new_profile.use_start_original_color = False
+        new_profile.use_active_original_color = False
+        new_profile.use_end_original_color = True
+        new_profile.start_transparency = 0.0
+        new_profile.active_start_transparency = 0.0
+        new_profile.active_finish_transparency = 0.0
+        new_profile.active_transparency_interpol = 1.0
+        new_profile.end_transparency = 0.0
+        new_profile.hide_at_end = False
+        
         props.active_profile_index = len(props.profiles) - 1
         return {'FINISHED'}
 
@@ -4848,24 +4745,6 @@ class SnapshotWithProfilesFixed(tool.Ifc.Operator, bpy.types.Operator):
             ws_props = tool.Sequence.get_work_schedule_props()
             anim_props = tool.Sequence.get_animation_props()
 
-            # --- Lock preferred group BEFORE computing frames ---
-            try:
-                _sel = _preferred_group(anim_props)
-                try:
-                    anim_props.profile_groups = _sel
-                except Exception:
-                    pass
-                try:
-                    ws_props.task_profile_group = _sel
-                except Exception:
-                    pass
-                try:
-                    tool.Sequence.sync_active_group_to_json()
-                except Exception:
-                    pass
-            except Exception as _e:
-                print(f"[Snapshot] Could not lock preferred group: {_e}")
-
             # Validate work schedule
             ws_id = getattr(ws_props, "active_work_schedule_id", None)
             if not ws_id:
@@ -5098,50 +4977,16 @@ class AddTaskFilter(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        # Preserve animation profile selection and flag operation to avoid unintended syncs
-        preserved_config = {}
-        try:
-            anim_props = tool.Sequence.get_animation_props()
-            preserved_config = {
-                'profile_groups': getattr(anim_props, 'profile_groups', ''),
-                'task_profile_group_selector': getattr(anim_props, 'task_profile_group_selector', ''),
-            }
-        except Exception:
-            pass
-
-        # Mark operation context
-        try:
-            context.scene['active_operation'] = 'add_task_filter'
-        except Exception:
-            pass
-
         props = tool.Sequence.get_work_schedule_props()
         new_rule = props.filters.rules.add()
-        # Initialize data_type/operators for the new rule
+        # Inicializa data_type/operadores de la nueva regla
         update_filter_column(new_rule, context)
-        # Useful default
+        # valor por defecto útil
         try:
-            new_rule.column = 'IfcTask.Name'
+            new_rule.column = "IfcTask.Name"
         except Exception:
             pass
         props.filters.active_rule_index = len(props.filters.rules) - 1
-
-        # Clear operation context and restore preserved settings
-        try:
-            if 'active_operation' in context.scene:
-                del context.scene['active_operation']
-        except Exception:
-            try:
-                context.scene['active_operation'] = ''
-            except Exception:
-                pass
-        try:
-            if preserved_config:
-                anim_props = tool.Sequence.get_animation_props()
-                anim_props.profile_groups = preserved_config.get('profile_groups', '')
-                anim_props.task_profile_group_selector = preserved_config.get('task_profile_group_selector', '')
-        except Exception:
-            pass
         return {'FINISHED'}
 
 class RemoveTaskFilter(bpy.types.Operator):
@@ -5165,46 +5010,16 @@ class ApplyTaskFilters(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        # CORREGIDO: Preservar configuración de perfiles durante filtrado
-        preserved_config = {}
-        try:
-            anim_props = tool.Sequence.get_animation_props()
-            preserved_config = {
-                'profile_groups': getattr(anim_props, 'profile_groups', ''),
-                'task_profile_group_selector': getattr(anim_props, 'task_profile_group_selector', ''),
-            }
-        except Exception:
-            pass
-
-        # Aplicar filtros
         work_schedule = tool.Sequence.get_active_work_schedule()
         if work_schedule:
-            # Marcar contexto como operación de filtro para evitar sync automático
-            context.scene["active_operation"] = 'apply_task_filters'
-
             tool.Sequence.load_task_tree(work_schedule)
             tool.Sequence.load_task_properties()
-
-            # Limpiar marcador (propiedad de escena)
-            try:
-                if "active_operation" in context.scene:
-                    del context.scene["active_operation"]
-            except Exception:
-                try:
-                    context.scene["active_operation"] = ""
-                except Exception:
-                    pass
-
-        # Restaurar configuración
-        try:
-            if preserved_config:
-                anim_props = tool.Sequence.get_animation_props()
-                anim_props.profile_groups = preserved_config.get('profile_groups', '')
-                anim_props.task_profile_group_selector = preserved_config.get('task_profile_group_selector', '')
-        except Exception:
-            pass
-
         return {'FINISHED'}
+# === FIN CÓDIGO PARA FILTROS (operators) ===
+
+
+# === INICIO CÓDIGO PARA GUARDAR/CARGAR FILTROS ===
+
 
 
 class UpdateSavedFilterSet(bpy.types.Operator):
@@ -5415,12 +5230,6 @@ class FilterDatePicker(bpy.types.Operator):
     rule_index: bpy.props.IntProperty(default=-1)
 
     def execute(self, context):
-        # Mark as datepicker operation to shield profile sync and auto-apply
-        try:
-            context.scene["active_operation"] = "datepicker"
-        except Exception:
-            pass
-
         props = tool.Sequence.get_work_schedule_props()
         if self.rule_index < 0 or self.rule_index >= len(props.filters.rules):
             self.report({'ERROR'}, "Invalid filter rule index.")
@@ -5432,22 +5241,19 @@ class FilterDatePicker(bpy.types.Operator):
             self.report({'ERROR'}, "No date selected.")
             return {'CANCELLED'}
             
-        # Actualizar el valor de la regla de filtro (sin auto-aplicar)
+        # Actualizar el valor de la regla de filtro
         target_rule = props.filters.rules[self.rule_index]
         target_rule.value_string = selected_date_str
-
-        # Clear operation flag
+        
+        # Aplicar los filtros automáticamente
         try:
-            del context.scene["active_operation"]
-        except Exception:
-            try:
-                context.scene["active_operation"] = ""
-            except Exception:
-                pass
+            # bpy.ops.bim.apply_task_filters()  # <--- LÍNEA CORREGIDA (COMENTADA)
+            pass  # No hacer nada automáticamente. El usuario aplicará los filtros manualmente.
+        except Exception as e:
+            print(f"Error applying filters: {e}")
         
         self.report({'INFO'}, f"Date set to: {selected_date_str}")
         return {"FINISHED"}
-
 
     def invoke(self, context, event):
         if self.rule_index < 0:
@@ -5574,158 +5380,3 @@ def unregister():
         bpy.utils.unregister_class(FilterDatePicker)
     except Exception as e:
         print(f"FilterDatePicker unregister failed: {e}")
-
-
-
-# === Overrides injected by automated fix (do not remove) ===
-
-def _update_filter_column_local(self, context):
-    """
-    Fallback local implementation that cleans values and detects data type.
-    It is only used if the real update_filter_column from prop.py is unavailable.
-    """
-    try:
-        parts = (getattr(self, 'column', '') or '').split('||')
-        self.data_type = parts[1] if len(parts) == 2 else 'string'
-        self.value_string = ''
-        self.value_integer = 0
-        self.value_float = 0.0
-        self.value_boolean = False
-    except Exception as e:
-        self.data_type = 'string'
-        try:
-            print(f"Warning: Filter column update failed: {e}")
-        except Exception:
-            pass
-        self.value_string = ''
-        self.value_integer = 0
-        self.value_float = 0.0
-        self.value_boolean = False
-
-
-class AddTaskFilter(bpy.types.Operator):
-    """Añade una nueva regla de filtro a la lista (override)."""
-    bl_idname = "bim.add_task_filter"
-    bl_label = "Add Task Filter"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        # Preserve animation profile selection and flag operation
-        preserved_config = {}
-        try:
-            anim_props = tool.Sequence.get_animation_props()
-            preserved_config = {
-                'profile_groups': getattr(anim_props, 'profile_groups', ''),
-                'task_profile_group_selector': getattr(anim_props, 'task_profile_group_selector', ''),
-            }
-        except Exception:
-            pass
-
-        # Mark operation context
-        try:
-            context.scene['active_operation'] = 'add_task_filter'
-        except Exception:
-            pass
-
-        try:
-            props = tool.Sequence.get_work_schedule_props()
-            new_rule = props.filters.rules.add()
-            # Initialize data_type/operators for the new rule
-            try:
-                update_filter_column(new_rule, context)  # prefer the real one
-            except Exception:
-                try:
-                    _update_filter_column_local(new_rule, context)  # fallback
-                except Exception:
-                    pass
-            # Useful default
-            try:
-                new_rule.column = 'IfcTask.Name'
-            except Exception:
-                pass
-            props.filters.active_rule_index = len(props.filters.rules) - 1
-
-        finally:
-            # Clear operation context and restore preserved settings
-            try:
-                if 'active_operation' in context.scene:
-                    del context.scene['active_operation']
-            except Exception:
-                try:
-                    context.scene['active_operation'] = ''
-                except Exception:
-                    pass
-            
-            try:
-                if preserved_config:
-                    anim_props = tool.Sequence.get_animation_props()
-                    anim_props.profile_groups = preserved_config.get('profile_groups', '')
-                    anim_props.task_profile_group_selector = preserved_config.get('task_profile_group_selector', '')
-            except Exception:
-                pass
-
-        return {'FINISHED'}
-
-
-class ApplyTaskFilters(bpy.types.Operator):
-    """Dispara el recálculo y la actualización de la lista de tareas (override)."""
-    bl_idname = "bim.apply_task_filters"
-    bl_label = "Apply Task Filters"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        # PRESERVAR: Configuración actual de perfiles
-        preserved_config = {}
-        try:
-            anim_props = tool.Sequence.get_animation_props()
-            preserved_config = {
-                'profile_groups': getattr(anim_props, 'profile_groups', ''),
-                'task_profile_group_selector': getattr(anim_props, 'task_profile_group_selector', ''),
-            }
-            print(f"🔒 FILTER: Preserving profile config: {preserved_config}")
-        except Exception:
-            pass
-
-        try:
-            # Marcar contexto como operación de filtro
-            context.scene["active_operation"] = 'apply_task_filters'
-
-            # Aplicar filtros
-            work_schedule = tool.Sequence.get_active_work_schedule()
-            if work_schedule:
-                tool.Sequence.load_task_tree(work_schedule)
-                tool.Sequence.load_task_properties()
-
-        finally:
-            # RESTAURAR: Configuración original - ESTO ES CRÍTICO
-            try:
-                if preserved_config:
-                    anim_props = tool.Sequence.get_animation_props()
-                    anim_props.profile_groups = preserved_config.get('profile_groups', '')
-                    anim_props.task_profile_group_selector = preserved_config.get('task_profile_group_selector', '')
-                    print(f"🔓 FILTER: Restored profile config: {preserved_config}")
-                    
-                    # FORZAR actualización de la UI de la tarea activa
-                    tprops = tool.Sequence.get_task_tree_props()
-                    wprops = tool.Sequence.get_work_schedule_props()
-                    if tprops.tasks and wprops.active_task_index < len(tprops.tasks):
-                        task = tprops.tasks[wprops.active_task_index]
-                        # Restaurar estado del checkbox
-                        try:
-                            task.use_active_profile_group = bool(preserved_config.get('task_profile_group_selector', ''))
-                        except Exception:
-                            pass
-            except Exception as e:
-                print(f"⚠️ Error restoring profile config: {e}")
-
-            # Limpiar marcador de operación
-            try:
-                if "active_operation" in context.scene:
-                    del context.scene["active_operation"]
-            except Exception:
-                try:
-                    context.scene["active_operation"] = ""
-                except Exception:
-                    pass
-
-        return {'FINISHED'}
