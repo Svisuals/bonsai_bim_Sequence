@@ -2319,6 +2319,163 @@ class Sequence(bonsai.core.tool.Sequence):
             [cls.demolished.add(tool.Ifc.get_object(input)) for input in inputs]
 
     @classmethod
+    def show_snapshot(cls, product_states):
+        """CORRECCIÓN: Respetar consider_start en snapshots"""
+
+        # 1. Limpiar keyframes previos y guardar propiedades originales
+        original_properties = {}
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH':
+                original_properties[obj.name] = {
+                    "color": list(obj.color),
+                    "hide": obj.hide_get()
+                }
+            if obj.animation_data:
+                obj.animation_data_clear()
+
+        # 2. Determinar el grupo de perfiles correcto DESDE EL ANIMATION STACK
+        anim_props = cls.get_animation_props()
+        active_group_name = None
+
+        # Iterar sobre el stack de animación para encontrar el primer grupo habilitado
+        for item in anim_props.animation_group_stack:
+            if item.enabled and item.group:
+                active_group_name = item.group
+                print(f"✅ Snapshot: Usando el grupo '{active_group_name}' desde el Animation Stack.")
+                break # Usar el primero que encuentre (el de mayor prioridad)
+
+        # Si el stack está vacío o no hay grupos habilitados, usar DEFAULT como fallback
+        if not active_group_name:
+            active_group_name = "DEFAULT"
+            print(f"⚠️ Snapshot: Animation Stack vacío. Usando grupo 'DEFAULT' como fallback.")
+
+        # Sincronizar el grupo de la UI si coincide con el que vamos a usar, para capturar cambios no guardados.
+        if active_group_name == getattr(anim_props, "profile_groups", None):
+            cls.sync_active_group_to_json()
+
+        # 3. Resetear todos los objetos IFC (ocultar por defecto)
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH' and tool.Ifc.get_entity(obj):
+                obj.hide_viewport = True
+                obj.hide_render = True
+                obj.color = (0.5, 0.5, 0.5, 0.2)
+
+        # 4. Mapeo de estados a perfiles del grupo activo
+        def get_task_profile(task_type):
+            """Obtiene el perfil correcto del grupo activo para el tipo de tarea."""
+            # Buscar perfil por nombre específico (ej: "CONSTRUCTION")
+            profile = cls.load_profile_from_group(active_group_name, task_type)
+            if profile:
+                return profile
+
+            # Si no, buscar el perfil "NOTDEFINED" dentro del mismo grupo
+            profile = cls.load_profile_from_group(active_group_name, "NOTDEFINED")
+            if profile:
+                return profile
+
+            # Como último recurso, crear un perfil genérico
+            return cls.create_generic_profile(task_type)
+
+        # 5. Configuración de estados
+        state_configs = {
+            "TO_BUILD": {"state": "start", "default_type": "CONSTRUCTION", "visibility": "hidden"},
+            "IN_CONSTRUCTION": {"state": "in_progress", "default_type": "CONSTRUCTION", "visibility": "visible"},
+            "COMPLETED": {"state": "end", "default_type": "CONSTRUCTION", "visibility": "visible"},
+            "TO_DEMOLISH": {"state": "start", "default_type": "DEMOLITION", "visibility": "visible"},
+            "IN_DEMOLITION": {"state": "in_progress", "default_type": "DEMOLITION", "visibility": "visible"},
+            "DEMOLISHED": {"state": "end", "default_type": "DEMOLITION", "visibility": "hidden"}
+        }
+
+        task_type_cache = {}
+        applied_count = 0
+
+        # 6. Aplicar estados visuales
+        for state_name, products in product_states.items():
+            if not products:
+                continue
+
+            config = state_configs.get(state_name)
+            if not config:
+                continue
+
+            for obj in products:
+                if not obj: continue
+
+                element = tool.Ifc.get_entity(obj)
+                if not element: continue
+
+                task = cls.get_task_for_product(element)
+                task_type = (task.PredefinedType if task else None) or config["default_type"]
+
+                profile = get_task_profile(task_type)
+                original_color = original_properties.get(obj.name, {}).get("color", [1,1,1,1])
+
+                # NUEVA LÓGICA: Si consider_start está activo, usar siempre apariencia de start
+                if getattr(profile, 'consider_start', False):
+                    # Forzar estado "start" independientemente del estado real del cronograma
+                    obj.hide_viewport = False
+                    obj.hide_render = False
+
+                    use_original = getattr(profile, 'use_start_original_color', False)
+                    color = original_color if use_original else list(profile.start_color)
+                    transparency = getattr(profile, 'start_transparency', 0.0)
+
+                    obj.color = (color[0], color[1], color[2], 1.0 - transparency)
+                    applied_count += 1
+                    print(f"✅ Snapshot: {obj.name} usa consider_start=True, aplicando apariencia de start")
+                    continue
+
+                # Aplicar visibilidad normal solo si consider_start está desactivado
+                if config["visibility"] == "hidden":
+                    obj.hide_viewport = True
+                    obj.hide_render = True
+                    applied_count += 1
+                    continue
+                else:
+                    obj.hide_viewport = False
+                    obj.hide_render = False
+
+                # Aplicar color y transparencia
+                state_key = config["state"]
+                color = [1,1,1,1]
+                transparency = 0.0
+
+                if state_key == "start":
+                    use_original = getattr(profile, 'use_start_original_color', False)
+                    color = original_color if use_original else list(profile.start_color)
+                    transparency = getattr(profile, 'start_transparency', 0.0)
+                elif state_key == "in_progress":
+                    use_original = getattr(profile, 'use_active_original_color', False)
+                    color = original_color if use_original else list(profile.in_progress_color)
+                    transparency = (getattr(profile, 'active_start_transparency', 0.0) + getattr(profile, 'active_finish_transparency', 0.0)) / 2.0
+                elif state_key == "end":
+                    use_original = getattr(profile, 'use_end_original_color', True)
+                    color = original_color if use_original else list(profile.end_color)
+                    transparency = getattr(profile, 'end_transparency', 0.0)
+
+                obj.color = (color[0], color[1], color[2], 1.0 - transparency)
+                applied_count += 1
+
+        # Al final, asegurar que objetos no procesados permanezcan ocultos
+        processed_objects = set()
+        for state_name, products in product_states.items():
+            for obj in products:
+                if obj:
+                    processed_objects.add(obj)
+
+        # Asegurar que objetos no procesados permanezcan ocultos
+        for obj in bpy.data.objects:
+            if (obj.type == 'MESH' and
+                tool.Ifc.get_entity(obj) and
+                obj not in processed_objects):
+                obj.hide_viewport = True
+                obj.hide_render = True
+
+        # 7. Configurar la vista 3D
+        cls.set_object_shading()
+        print(f"✅ Snapshot aplicado a {applied_count} objetos usando el grupo '{active_group_name}'")
+
+    @classmethod
     def get_task_for_product(cls, product):
         """Obtiene la tarea asociada a un producto IFC."""
         element = tool.Ifc.get_entity(product) if hasattr(product, 'name') else product
@@ -2805,6 +2962,57 @@ class Sequence(bonsai.core.tool.Sequence):
                 pass
         data[active_group] = {"profiles": profiles_data}
         scene["BIM_AppearanceProfileSets"] = json.dumps(data)
+    @classmethod
+    def animate_objects_with_profiles(cls, settings, product_frames):
+        animation_props = cls.get_animation_props()
+        # Lógica del grupo activo (stack → DEFAULT)
+        active_group_name = None
+        for item in getattr(animation_props, "animation_group_stack", []):
+            if getattr(item, "enabled", False) and getattr(item, "group", None):
+                active_group_name = item.group
+                break
+        if not active_group_name:
+            active_group_name = "DEFAULT"
+        print(f"🎬 INICIANDO ANIMACIÓN: Usando el grupo de perfiles '{active_group_name}'")
+
+        original_colors = {}
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH':
+                original_colors[obj.name] = list(obj.color)
+
+        for obj in bpy.data.objects:
+            element = tool.Ifc.get_entity(obj)
+            if not element:
+                continue
+
+            if element.is_a("IfcSpace"):
+                cls.hide_object(obj)
+                continue
+
+            original_color = original_colors.get(obj.name, [1.0, 1.0, 1.0, 1.0])
+
+            if element.id() not in product_frames:
+                # Ocultar objetos que están fuera del rango de visualización
+                obj.hide_viewport = True
+                obj.hide_render = True
+                continue
+
+            for frame_data in product_frames[element.id()]:
+                task = frame_data.get("task") or tool.Ifc.get().by_id(frame_data.get("task_id"))
+                profile = cls.get_assigned_profile_for_task(task, animation_props, active_group_name)
+                if not profile:
+                    predefined_type = getattr(task, "PredefinedType", None) or "NOTDEFINED"
+                    profile = cls.load_profile_from_group(active_group_name, predefined_type) or cls.create_generic_profile(predefined_type)
+                cls.apply_profile_animation(obj, frame_data, profile, original_color, settings)
+
+        area = tool.Blender.get_view3d_area()
+        try:
+            area.spaces[0].shading.color_type = "OBJECT"
+        except Exception:
+            pass
+        bpy.context.scene.frame_start = settings["start_frame"]
+        bpy.context.scene.frame_end = int(settings["start_frame"] + settings["total_frames"] + 1)
+
     @classmethod
     def create_generic_profile(cls, predefined_type):
         return type('AppearanceProfile', (object,), {
@@ -3870,224 +4078,6 @@ class Sequence(bonsai.core.tool.Sequence):
 
 
 
-    @classmethod
-    def animate_objects_with_profiles(cls, settings, product_frames):
-        animation_props = cls.get_animation_props()
-
-        # --- NUEVO: Determinar grupo activo respetando configuración personalizada ---
-        active_group_name = None
-
-        # 1. Prioridad: Grupo personalizado configurado para tareas
-        custom_group = getattr(animation_props, "task_profile_group_selector", "")
-        if custom_group and custom_group != "DEFAULT":
-            active_group_name = custom_group
-            print(f"🎬 ANIMATION: Using CUSTOM group '{active_group_name}' (from task selector)")
-        else:
-            # 2. Fallback: Primer grupo habilitado en animation stack
-            for item in getattr(animation_props, "animation_group_stack", []):
-                if getattr(item, "enabled", False) and getattr(item, "group", None):
-                    active_group_name = item.group
-                    break
-
-            if not active_group_name:
-                active_group_name = "DEFAULT"
-
-            print(f"🎬 ANIMATION: Using stack/default group '{active_group_name}'")
-
-        original_colors = {}
-        for obj in bpy.data.objects:
-            if obj.type == 'MESH':
-                original_colors[obj.name] = list(obj.color)
-
-        for obj in bpy.data.objects:
-            element = tool.Ifc.get_entity(obj)
-            if not element:
-                continue
-
-            if element.is_a("IfcSpace"):
-                cls.hide_object(obj)
-                continue
-
-            original_color = original_colors.get(obj.name, [1.0, 1.0, 1.0, 1.0])
-
-            if element.id() not in product_frames:
-                obj.hide_viewport = True
-                obj.hide_render = True
-                continue
-
-            for frame_data in product_frames[element.id()]:
-                task = frame_data.get("task") or tool.Ifc.get().by_id(frame_data.get("task_id"))
-                profile = cls.get_assigned_profile_for_task(task, animation_props, active_group_name)
-                if not profile:
-                    predefined_type = getattr(task, "PredefinedType", None) or "NOTDEFINED"
-                    profile = cls.load_profile_from_group(active_group_name, predefined_type) or cls.create_generic_profile(predefined_type)
-                cls.apply_profile_animation(obj, frame_data, profile, original_color, settings)
-
-        area = tool.Blender.get_view3d_area()
-        try:
-            area.spaces[0].shading.color_type = "OBJECT"
-        except Exception:
-            pass
-        bpy.context.scene.frame_start = settings["start_frame"]
-        bpy.context.scene.frame_end = int(settings["start_frame"] + settings["total_frames"] + 1)
-    @classmethod
-    def show_snapshot(cls, product_states):
-        """CORREGIDO: Respetar configuración de grupos personalizados"""
-
-        # 1. Limpiar keyframes previos y guardar propiedades originales
-        original_properties = {}
-        for obj in bpy.data.objects:
-            if obj.type == 'MESH':
-                original_properties[obj.name] = {
-                    "color": list(obj.color),
-                    "hide": obj.hide_get()
-                }
-            if obj.animation_data:
-                obj.animation_data_clear()
-
-        # 2. --- NUEVO: Determinar grupo respetando configuración personalizada ---
-        anim_props = cls.get_animation_props()
-        active_group_name = None
-
-        # Prioridad 1: Grupo personalizado configurado para tareas
-        custom_group = getattr(anim_props, "task_profile_group_selector", "")
-        if custom_group and custom_group != "DEFAULT":
-            active_group_name = custom_group
-            print(f"📸 SNAPSHOT: Using CUSTOM group '{active_group_name}' (from task selector)")
-        else:
-            # Prioridad 2: Buscar en animation stack
-            for item in getattr(anim_props, "animation_group_stack", []):
-                if getattr(item, 'enabled', False) and getattr(item, 'group', None):
-                    active_group_name = item.group
-                    print(f"📸 SNAPSHOT: Using STACK group '{active_group_name}'")
-                    break
-
-        # Fallback a DEFAULT
-        if not active_group_name:
-            active_group_name = "DEFAULT"
-            print(f"📸 SNAPSHOT: Using DEFAULT group as fallback")
-
-        # Sincronizar SOLO si el grupo activo coincide con el de edición
-        if active_group_name == getattr(anim_props, "profile_groups", None):
-            cls.sync_active_group_to_json()
-
-        # 3. Resetear todos los objetos IFC (ocultar por defecto)
-        for obj in bpy.data.objects:
-            if obj.type == 'MESH' and tool.Ifc.get_entity(obj):
-                obj.hide_viewport = True
-                obj.hide_render = True
-                obj.color = (0.5, 0.5, 0.5, 0.2)
-
-        # 4. Función helper para obtener perfiles
-        def get_task_profile(task_type):
-            """Obtiene el perfil correcto del grupo activo para el tipo de tarea."""
-            profile = cls.load_profile_from_group(active_group_name, task_type)
-            if profile:
-                return profile
-
-            # Si no, buscar el perfil "NOTDEFINED" dentro del mismo grupo
-            profile = cls.load_profile_from_group(active_group_name, "NOTDEFINED")
-            if profile:
-                return profile
-
-            # Como último recurso, crear un perfil genérico
-            return cls.create_generic_profile(task_type)
-
-        # 5. Configuración de estados (sin cambios)
-        state_configs = {
-            "TO_BUILD": {"state": "start", "default_type": "CONSTRUCTION", "visibility": "hidden"},
-            "IN_CONSTRUCTION": {"state": "in_progress", "default_type": "CONSTRUCTION", "visibility": "visible"},
-            "COMPLETED": {"state": "end", "default_type": "CONSTRUCTION", "visibility": "visible"},
-            "TO_DEMOLISH": {"state": "start", "default_type": "DEMOLITION", "visibility": "visible"},
-            "IN_DEMOLITION": {"state": "in_progress", "default_type": "DEMOLITION", "visibility": "visible"},
-            "DEMOLISHED": {"state": "end", "default_type": "DEMOLITION", "visibility": "hidden"}
-        }
-
-        task_type_cache = {}
-        applied_count = 0
-
-        # 6. Aplicar estados visuales (resto sin cambios...)
-        for state_name, products in product_states.items():
-            if not products:
-                continue
-
-            config = state_configs.get(state_name)
-            if not config:
-                continue
-
-            for obj in products:
-                if not obj: continue
-
-                element = tool.Ifc.get_entity(obj)
-                if not element: continue
-
-                task = cls.get_task_for_product(element)
-                task_type = (task.PredefinedType if task else None) or config["default_type"]
-
-                profile = get_task_profile(task_type)
-                original_color = original_properties.get(obj.name, {}).get("color", [1,1,1,1])
-
-                # Lógica de consider_start (sin cambios)
-                if getattr(profile, 'consider_start', False):
-                    obj.hide_viewport = False
-                    obj.hide_render = False
-
-                    use_original = getattr(profile, 'use_start_original_color', False)
-                    color = original_color if use_original else list(profile.start_color)
-                    transparency = getattr(profile, 'start_transparency', 0.0)
-
-                    obj.color = (color[0], color[1], color[2], 1.0 - transparency)
-                    applied_count += 1
-                    continue
-
-                # Aplicar visibilidad normal
-                if config["visibility"] == "hidden":
-                    obj.hide_viewport = True
-                    obj.hide_render = True
-                    applied_count += 1
-                    continue
-                else:
-                    obj.hide_viewport = False
-                    obj.hide_render = False
-
-                # Aplicar color y transparencia (resto sin cambios...)
-                state_key = config["state"]
-                color = [1,1,1,1]
-                transparency = 0.0
-
-                if state_key == "start":
-                    use_original = getattr(profile, 'use_start_original_color', False)
-                    color = original_color if use_original else list(profile.start_color)
-                    transparency = getattr(profile, 'start_transparency', 0.0)
-                elif state_key == "in_progress":
-                    use_original = getattr(profile, 'use_active_original_color', False)
-                    color = original_color if use_original else list(profile.in_progress_color)
-                    transparency = (getattr(profile, 'active_start_transparency', 0.0) + getattr(profile, 'active_finish_transparency', 0.0)) / 2.0
-                elif state_key == "end":
-                    use_original = getattr(profile, 'use_end_original_color', True)
-                    color = original_color if use_original else list(profile.end_color)
-                    transparency = getattr(profile, 'end_transparency', 0.0)
-
-                obj.color = (color[0], color[1], color[2], 1.0 - transparency)
-                applied_count += 1
-
-        # Al final, asegurar que objetos no procesados permanezcan ocultos
-        processed_objects = set()
-        for state_name, products in product_states.items():
-            for obj in products:
-                if obj:
-                    processed_objects.add(obj)
-
-        for obj in bpy.data.objects:
-            if (obj.type == 'MESH' and
-                tool.Ifc.get_entity(obj) and
-                obj not in processed_objects):
-                obj.hide_viewport = True
-                obj.hide_render = True
-
-        # 7. Configurar la vista 3D
-        cls.set_object_shading()
-        print(f"✅ Snapshot aplicado a {applied_count} objetos usando el grupo '{active_group_name}'")
 class SearchCustomProfileGroup(bpy.types.Operator):
     bl_idname = "bim.search_custom_profile_group"
     bl_label = "Search Custom Profile Group"
