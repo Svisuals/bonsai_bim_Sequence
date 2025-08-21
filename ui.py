@@ -384,16 +384,6 @@ class BIM_PT_work_schedules(Panel):
             info_row = active_filters_box.row()
             info_row.label(text=f"ℹ️ {active_filters_count} active filter(s)", icon='INFO')
 
-        # NUEVO: Indicador de protección de perfiles
-        try:
-            anim_props = tool.Sequence.get_animation_props()
-            custom_group = getattr(anim_props, "task_profile_group_selector", "")
-            if custom_group:
-                protection_row = active_filters_box.row()
-                protection_row.label(text=f"🛡️ Profile config '{custom_group}' protected", icon='LOCKED')
-        except Exception:
-            pass
-
         # 3. Panel de Filtros Guardados (ahora colapsable)
         saved_filters_box = main_box.box()
         row = saved_filters_box.row(align=True)
